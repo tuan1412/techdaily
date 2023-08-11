@@ -1,0 +1,118 @@
+---
+title: Batch request processing with Go
+date: 08-10-2023
+---
+Vấn đề:
+- Với hệ thống write heavily, nếu mỗi request tương ứng với một cmd insert vào DB thì sẽ gây cao tải cho hệ thống ở tại một thời điểm nhất định. Một trong những cách giảm tải là batch processing
+
+- Ý tưởng như sau:
+1. Gom những request vào một batch có max capacity, max wait time, msg truyền vào batch sẽ bao gồm tham số để tính toán và một channel để nhận lại kết quả
+2. Batch sau khi đạt max capacity hoặc max wait time sẽ xử lý insert batch vào DB, lấy được ID của record và trả vào channel
+3. Request lắng nghe kết quả của channel, sẽ có context timeout để tránh chờ forever
+
+Demo code
+```
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/facebookgo/muster"
+)
+
+type Msg struct {
+	args   int64
+	result chan int64
+}
+
+type DBClient struct {
+	MaxBatchSize        uint          // How much a shopper can carry at a time.
+	BatchTimeout        time.Duration // How long we wait once we need to get something.
+	PendingWorkCapacity uint          // How long our shopping list can be.
+	muster              muster.Client
+}
+
+func (s *DBClient) Start() error {
+	s.muster.MaxBatchSize = s.MaxBatchSize
+	s.muster.BatchTimeout = s.BatchTimeout
+	s.muster.PendingWorkCapacity = s.PendingWorkCapacity
+	s.muster.BatchMaker = func() muster.Batch { return &batch{Client: s} }
+	return s.muster.Start()
+}
+
+func (s *DBClient) Stop() error {
+	return s.muster.Stop()
+}
+
+func (s *DBClient) Add(item interface{}) {
+	s.muster.Work <- item
+}
+
+type batch struct {
+	Client *DBClient
+	Items  []Msg
+}
+
+func (b *batch) Add(item interface{}) {
+	b.Items = append(b.Items, item.(Msg))
+}
+
+func (b *batch) Fire(notifier muster.Notifier) {
+	defer notifier.Done()
+
+	for _, msg := range b.Items {
+		args, c := msg.args, msg.result
+
+		select {
+		case <-c:
+		default:
+			c <- args * 2
+		}
+	}
+}
+
+func callAPI(args int64, sm *DBClient, name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result := make(chan int64)
+	sm.Add(Msg{args: args, result: result})
+
+	select {
+	case <-ctx.Done():
+		close(result)
+		fmt.Println("timeout")
+	case c := <-result:
+		close(result)
+		fmt.Println(name, c)
+	}
+}
+
+func main() {
+	sm := &DBClient{
+		MaxBatchSize:        3,
+		BatchTimeout:        1 * time.Second,
+		PendingWorkCapacity: 100,
+	}
+
+	// We need to start the muster.
+	if err := sm.Start(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	go callAPI(1, sm, "1")
+	go callAPI(2, sm, "2")
+
+	time.Sleep(15 * time.Second)
+
+	// Stopping the muster ensures we wait for all batches to finish.
+	if err := sm.Stop(); err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+```
